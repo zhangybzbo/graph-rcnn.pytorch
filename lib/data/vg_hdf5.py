@@ -49,7 +49,7 @@ class vg_hdf5(Dataset):
                                   self.predicate_to_ind[k])
         # cfg.ind_to_predicate = self.ind_to_predicates
 
-        self.split_mask, self.image_index, self.im_sizes, self.gt_boxes, self.gt_classes, self.relationships = load_graphs(
+        self.split_mask, self.image_index, self.im_sizes, self.gt_boxes, self.gt_classes, self.relationships, self.img_names = load_graphs(
             self.roidb_file, self.image_file,
             self.split, num_im, num_val_im=num_val_im,
             filter_empty_rels=filter_empty_rels,
@@ -91,11 +91,12 @@ class vg_hdf5(Dataset):
 
     def _im_getter(self, idx):
         w, h = self.im_sizes[idx, :]
+        name = self.img_names[idx]
         ridx = self.image_index[idx]
         im = self.im_refs[ridx]
         im = im[:, :h, :w] # crop out
         im = im.transpose((1,2,0)) # c h w -> h w c
-        return im
+        return im, name
 
     def __len__(self):
         return len(self.image_index)
@@ -105,7 +106,9 @@ class vg_hdf5(Dataset):
         get dataset item
         """
         # get image
-        img = Image.fromarray(self._im_getter(index)); width, height = img.size
+        img, name = self._im_getter(index)
+        img = Image.fromarray(img)
+        width, height = img.size
 
         # get object bounding boxes, labels and relations
         obj_boxes = self.gt_boxes[index].copy()
@@ -137,7 +140,7 @@ class vg_hdf5(Dataset):
         target.add_field("relation_labels", torch.from_numpy(obj_relation_triplets))
         target = target.clip_to_image(remove_empty=False)
 
-        return img, target, index
+        return img, target, index, name
 
     def get_groundtruth(self, index):
         width, height = self.im_sizes[index, :]
@@ -180,6 +183,72 @@ class vg_hdf5(Dataset):
         return self.ind_to_classes[class_id]
 
 
+class vg_hdf5_produce(Dataset):
+    def __init__(self, cfg, transforms=None, num_im=-1,):
+        assert num_im >= -1, "the number of samples must be >= 0"
+        self.data_dir = cfg.DATASET.PATH
+        self.transforms = transforms
+
+        self.image_file = os.path.join(self.data_dir, "GQA_imdb_1024.h5")
+        # read in dataset from a h5 file and a dict (json) file
+        assert os.path.exists(self.data_dir), \
+            "cannot find folder {}, please download the visual genome data into this folder".format(self.data_dir)
+        self.im_h5 = h5py.File(self.image_file, 'r')
+        self.info = json.load(open(os.path.join(self.data_dir, "VG-SGG-dicts.json"), 'r'))
+        self.im_refs = self.im_h5['images'] # image data reference
+        im_scale = self.im_refs.shape[2]
+
+        # add background class
+        self.info['label_to_idx']['__background__'] = 0
+        self.class_to_ind = self.info['label_to_idx']
+        self.ind_to_classes = sorted(self.class_to_ind, key=lambda k:
+                               self.class_to_ind[k])
+        # cfg.ind_to_class = self.ind_to_classes
+
+        self.predicate_to_ind = self.info['predicate_to_idx']
+        self.predicate_to_ind['__background__'] = 0
+        self.ind_to_predicates = sorted(self.predicate_to_ind, key=lambda k:
+                                  self.predicate_to_ind[k])
+        # cfg.ind_to_predicate = self.ind_to_predicates
+
+        self.image_index, self.im_sizes = load_indexs(self.image_file, num_im)
+
+        self.json_category_id_to_contiguous_id = self.class_to_ind
+
+        self.contiguous_category_id_to_json_id = {
+            v: k for k, v in self.json_category_id_to_contiguous_id.items()
+        }
+
+    def _im_getter(self, idx):
+        w, h = self.im_sizes[idx, :]
+        ridx = self.image_index[idx]
+        im = self.im_refs[idx]
+        im = im[:, :h, :w] # crop out
+        im = im.transpose((1,2,0)) # c h w -> h w c
+        return im, ridx
+
+    def __len__(self):
+        return len(self.image_index)
+
+    def __getitem__(self, index):
+        """
+        get dataset item
+        """
+        # get image
+        img, img_id = self._im_getter(index)
+        img = Image.fromarray(img); width, height = img.size
+        img, target = self.transforms(img, None)
+        assert not target
+
+        return img, index, img_id
+
+    def get_img_info(self, img_id):
+        w, h = self.im_sizes[img_id, :]
+        return {"height": h, "width": w}
+
+    def map_class_id_to_class_name(self, class_id):
+        return self.ind_to_classes[class_id]
+
 def load_graphs(graphs_file, images_file, mode='train', num_im=-1, num_val_im=0, filter_empty_rels=True,
                 filter_non_overlap=False):
     """
@@ -204,7 +273,7 @@ def load_graphs(graphs_file, images_file, mode='train', num_im=-1, num_val_im=0,
     im_h5 = h5py.File(images_file, 'r')
 
     data_split = roi_h5['split'][:]
-    split = 2 if mode == 'test' else 0
+    split = 1 if mode == 'test' else 0
     split_mask = data_split == split
 
     # Filter out images without bounding boxes
@@ -242,6 +311,7 @@ def load_graphs(graphs_file, images_file, mode='train', num_im=-1, num_val_im=0,
 
     im_widths = im_h5["image_widths"][split_mask]
     im_heights = im_h5["image_heights"][split_mask]
+    image_names = im_h5["image_ids"][split_mask]
 
     # load relation labels
     _relations = roi_h5['relationships'][:]
@@ -287,4 +357,41 @@ def load_graphs(graphs_file, images_file, mode='train', num_im=-1, num_val_im=0,
         relationships.append(rels)
 
     im_sizes = np.stack(im_sizes, 0)
-    return split_mask, image_index_valid, im_sizes, boxes, gt_classes, relationships
+    return split_mask, image_index_valid, im_sizes, boxes, gt_classes, relationships, image_names
+
+def load_indexs(images_file, num_im):
+    """
+    Load the file containing the GT boxes and relations, as well as the dataset split
+    :param graphs_file: HDF5
+    :param mode: (train, val, or test)
+    :param num_im: Number of images we want
+    :param num_val_im: Number of validation images
+    :param filter_empty_rels: (will be filtered otherwise.)
+    :param filter_non_overlap: If training, filter images that dont overlap.
+    :return: image_index: numpy array corresponding to the index of images we're using
+             boxes: List where each element is a [num_gt, 4] array of ground
+                    truth boxes (x1, y1, x2, y2)
+             gt_classes: List where each element is a [num_gt] array of classes
+             relationships: List where each element is a [num_r, 3] array of
+                    (box_ind_1, box_ind_2, predicate) relationships
+    """
+    im_h5 = h5py.File(images_file, 'r')
+
+    if num_im == -1:
+        im_widths = im_h5["image_widths"][:]
+        im_heights = im_h5["image_heights"][:]
+        image_ids = im_h5["image_ids"][:]
+    else:
+        im_widths = im_h5["image_widths"][:num_im]
+        im_heights = im_h5["image_heights"][:num_im]
+        image_ids = im_h5["image_ids"][:num_im]
+
+    # Get everything by image.
+    im_sizes = []
+    image_index_valid = []
+    for i in range(im_widths.shape[0]):
+        image_index_valid.append(image_ids[i])
+        im_sizes.append(np.array([im_widths[i], im_heights[i]]))
+
+    im_sizes = np.stack(im_sizes, 0)
+    return image_index_valid, im_sizes

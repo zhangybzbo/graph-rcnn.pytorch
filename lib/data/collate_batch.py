@@ -8,15 +8,22 @@ class BatchCollator(object):
     This should be passed to the DataLoader
     """
 
-    def __init__(self, size_divisible=0):
+    def __init__(self, size_divisible=0, produce=False):
         self.size_divisible = size_divisible
+        self.produce = produce
 
     def __call__(self, batch):
         transposed_batch = list(zip(*batch))
         images = to_image_list(transposed_batch[0], self.size_divisible)
-        targets = transposed_batch[1]
-        img_ids = transposed_batch[2]
-        return images, targets, img_ids
+        if self.produce:
+            img_idx = transposed_batch[1]
+            img_ids = transposed_batch[2]
+            return images, img_idx, img_ids
+        else:
+            targets = transposed_batch[1]
+            img_ids = transposed_batch[2]
+            img_name = transposed_batch[3]
+            return images, targets, img_ids, img_name
 
 
 class BBoxAugCollator(object):

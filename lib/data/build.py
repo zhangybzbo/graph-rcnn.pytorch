@@ -2,7 +2,7 @@ import copy
 import bisect
 import torch
 from torch.utils import data
-from .vg_hdf5 import vg_hdf5
+from .vg_hdf5 import vg_hdf5, vg_hdf5_produce
 from . import samplers
 from .transforms import build_transforms
 from .collate_batch import BatchCollator
@@ -53,11 +53,14 @@ def make_batch_data_sampler(
         )
     return batch_sampler
 
-def build_data_loader(cfg, split="train", num_im=-1, is_distributed=False, start_iter=0):
+def build_data_loader(cfg, split="train", num_im=-1, is_distributed=False, start_iter=0, produce=False):
     num_gpus = get_world_size()
     if cfg.DATASET.NAME == "vg" and cfg.DATASET.MODE == "benchmark":
         transforms = build_transforms(cfg, is_train=True if split=="train" else False)
-        dataset = vg_hdf5(cfg, split=split, transforms=transforms, num_im=num_im)
+        if produce:
+            dataset = vg_hdf5_produce(cfg, transforms=transforms, num_im=num_im)
+        else:
+            dataset = vg_hdf5(cfg, split=split, transforms=transforms, num_im=num_im)
         sampler = make_data_sampler(dataset, True if split == "train" else False, is_distributed)
         images_per_batch = cfg.DATASET.TRAIN_BATCH_SIZE if split == "train" else cfg.DATASET.TEST_BATCH_SIZE
         if get_rank() == 0:
@@ -69,7 +72,7 @@ def build_data_loader(cfg, split="train", num_im=-1, is_distributed=False, start
         batch_sampler = make_batch_data_sampler(
             dataset, sampler, aspect_grouping, images_per_gpu, num_iters, start_iter
         )
-        collator = BatchCollator(cfg.DATASET.SIZE_DIVISIBILITY)
+        collator = BatchCollator(cfg.DATASET.SIZE_DIVISIBILITY, produce)
         dataloader = data.DataLoader(dataset,
                 num_workers=images_per_batch,
                 batch_sampler=batch_sampler,

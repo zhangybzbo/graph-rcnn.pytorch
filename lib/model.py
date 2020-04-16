@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import cv2
+import json, h5py, pickle
 from .data.build import build_data_loader
 from .scene_parser.parser import build_scene_parser
 from .scene_parser.parser import build_scene_parser_optimizer
@@ -19,7 +20,7 @@ class SceneGraphGeneration:
     """
     Scene graph generation
     """
-    def __init__(self, cfg, arguments, local_rank, distributed):
+    def __init__(self, cfg, arguments, local_rank, distributed, produce):
         """
         initialize scene graph generation model
         """
@@ -29,7 +30,7 @@ class SceneGraphGeneration:
 
         # build data loader
         self.data_loader_train = build_data_loader(cfg, split="train", is_distributed=distributed)
-        self.data_loader_test = build_data_loader(cfg, split="test", is_distributed=distributed)
+        self.data_loader_test = build_data_loader(cfg, split="test", is_distributed=distributed, produce=produce)
 
         cfg.DATASET.IND_TO_OBJECT = self.data_loader_train.dataset.ind_to_classes
         cfg.DATASET.IND_TO_PREDICATE = self.data_loader_train.dataset.ind_to_predicates
@@ -122,11 +123,10 @@ class SceneGraphGeneration:
         self.scene_parser.train()
         start_training_time = time.time()
         end = time.time()
-        for i, data in enumerate(self.data_loader_train, start_iter):
+        for i, data in enumerate(self.data_loader_train):
             data_time = time.time() - end
             self.arguments["iteration"] = i
-            self.sp_scheduler.step()
-            imgs, targets, _ = data
+            imgs, targets, _, _ = data
             imgs = imgs.to(self.device); targets = [target.to(self.device) for target in targets]
             loss_dict = self.scene_parser(imgs, targets)
             losses = sum(loss for loss in loss_dict.values())
@@ -139,6 +139,7 @@ class SceneGraphGeneration:
             self.sp_optimizer.zero_grad()
             losses.backward()
             self.sp_optimizer.step()
+            self.sp_scheduler.step()
 
             batch_time = time.time() - end
             end = time.time()
@@ -201,9 +202,12 @@ class SceneGraphGeneration:
             top_prediction = select_top_predictions(prediction)
             img = imgs.tensors[i].permute(1, 2, 0).contiguous().cpu().numpy() + np.array(self.cfg.INPUT.PIXEL_MEAN).reshape(1, 1, 3)
             result = img.copy()
+            r = result[:,:,0].copy()
+            result[:,:,0] = result[:,:,2]
+            result[:,:,2] = r
             result = overlay_boxes(result, top_prediction)
             result = overlay_class_names(result, top_prediction, dataset.ind_to_classes)
-            cv2.imwrite(os.path.join(visualize_folder, "detection_{}.jpg".format(img_ids[i])), result)
+            cv2.imwrite(os.path.join(visualize_folder, "detection_{}.jpg".format(img_ids[i].decode("utf-8"))), result)
 
     def test(self, timer=None, visualize=False):
         """
@@ -222,7 +226,7 @@ class SceneGraphGeneration:
         total_timer.tic()
         reg_recalls = []
         for i, data in enumerate(self.data_loader_test, 0):
-            imgs, targets, image_ids = data
+            imgs, targets, image_ids, img_name = data
             imgs = imgs.to(self.device); targets = [target.to(self.device) for target in targets]
             if i % 10 == 0:
                 logger.info("inference on batch {}/{}...".format(i, len(self.data_loader_test)))
@@ -241,7 +245,7 @@ class SceneGraphGeneration:
                     timer.toc()
                 output = [o.to(cpu_device) for o in output]
                 if visualize:
-                    self.visualize_detection(self.data_loader_test.dataset, image_ids, imgs, output)
+                    self.visualize_detection(self.data_loader_test.dataset, img_name, imgs, output)
             results_dict.update(
                 {img_id: result for img_id, result in zip(image_ids, output)}
             )
@@ -302,6 +306,144 @@ class SceneGraphGeneration:
                             predictions_pred=predictions_pred,
                             output_folder=output_folder,
                             **extra_args)
+                            
+    def list_detection(self, dataset, img_ids, predictions):
+        ls = {}
+        for i, prediction in enumerate(predictions):
+            datum = {}
+            # top_prediction = select_top_predictions(prediction)
+            datum['scores'] = prediction.get_field("scores").cpu().numpy()
+            datum['labels'] = prediction.get_field("labels").cpu().numpy()
+            datum['names'] = [dataset.ind_to_classes[i] for i in datum['labels']]
+            # datum['features'] = prediction.get_field("features").view(-1, 2048).cpu().numpy() 
+            datum['boxes'] = prediction.bbox.cpu().numpy()
+            ls[img_ids[i].decode("utf-8")] = datum
+        return ls
+        
+    def list_rel(self, dataset, img_ids, objects, predictions):
+        ls = {}
+        for i, (object, prediction) in enumerate(zip(objects, predictions)):
+            datum = []
+            obj_score = object.get_field("scores").cpu().numpy()
+            obj_label = object.get_field("labels").cpu().numpy()
+            all_rels = prediction.get_field("idx_pairs").cpu().numpy()
+            fp_pred = prediction.get_field("scores").cpu().numpy()
+            for j in range(fp_pred.shape[0]):
+                # datum : [(obj0), (obj1), rel]
+                # obj0, obj1 : (idx_objpre, score, name)
+                # rel : (score, name)
+                obj0 = (all_rels[j, 0], obj_score[all_rels[j, 0]], dataset.ind_to_classes[obj_label[all_rels[j, 0]]])
+                obj1 = (all_rels[j, 1], obj_score[all_rels[j, 1]], dataset.ind_to_classes[obj_label[all_rels[j, 1]]])
+                pre_id = np.argmax(fp_pred[j, 1:]) + 1
+                score = fp_pred[j, pre_id]
+                assert score == fp_pred[j, 1:].max()
+                rel = dataset.ind_to_predicates[pre_id]
+                relation = (score, rel)
+                if obj0[1] > 0.2 and obj1[1] > 0.2 and relation[0] > 0.2:
+                    datum.append([obj0, obj1, relation])
+            ls[img_ids[i].decode("utf-8")] = datum
+        return ls
 
-def build_model(cfg, arguments, local_rank, distributed):
-    return SceneGraphGeneration(cfg, arguments, local_rank, distributed)
+    def produce(self, timer=None, visualize=False):
+        """
+        main body for testing scene graph generation model
+        """
+        logger = logging.getLogger("scene_graph_generation.inference")
+        logger.info("Start evaluating")
+        self.scene_parser.eval()
+        cpu_device = torch.device("cpu")
+        total_timer = Timer()
+        inference_timer = Timer()
+        total_timer.tic()
+        
+        info = {}
+        file_num = 0
+        accu = 0
+        save_x = np.zeros((10000, 100, 2048))
+        save_b = np.zeros((10000, 100, 4))
+        save_objs = {}
+        save_rels = {}
+        for i, data in enumerate(self.data_loader_test, 0):
+            imgs, image_idx, image_ids = data
+            imgs = imgs.to(self.device)
+            if i % 10 == 0:
+                logger.info("inference on batch {}/{}...".format(i, len(self.data_loader_test)))
+            with torch.no_grad():
+                if timer:
+                    timer.tic()
+                output = self.scene_parser(imgs)
+                if self.cfg.MODEL.RELATION_ON:
+                    output, output_pred = output
+                    output_pred = [o.to(cpu_device) for o in output_pred]
+                if timer:
+                    torch.cuda.synchronize()
+                    timer.toc()
+                output = [o.to(cpu_device) for o in output]
+                if visualize:
+                    self.visualize_detection(self.data_loader_test.dataset, image_ids, imgs, output)
+                save_objs.update(self.list_detection(self.data_loader_test.dataset, image_ids, output))
+                
+                for j, prediction in enumerate(output):
+                    info[image_ids[j].decode("utf-8")] = {'file': file_num, 'idx': (accu % 10000), 'img': image_ids[j].decode("utf-8")}
+                    num_obj = prediction.bbox.size(0)
+                    save_x[accu % 10000, :num_obj, :] = prediction.get_field("features").view(-1, 2048).cpu().numpy() 
+                    save_b[accu % 10000, :num_obj, :] = prediction.bbox.cpu().numpy()
+                    accu += 1
+                    assert (accu - 1) // 10000 == file_num
+                    if accu % 10000 == 0:
+                        with h5py.File("results/gqa_preobjects_%d.h5" % file_num, "w") as f:
+                            dset1 = f.create_dataset("features", data=save_x, dtype='float32')
+                            dset2 = f.create_dataset("bboxes", data=save_b, dtype='float32')
+                            print('save', "results/gqa_preobjects_%d.h5" % file_num)
+                            file_num += 1
+                            save_x = np.zeros((10000, 100, 2048))
+                            save_b = np.zeros((10000, 100, 4))
+                
+            if self.cfg.MODEL.RELATION_ON:
+                save_rels.update(self.list_rel(self.data_loader_test.dataset, image_ids, output, output_pred))
+            if self.cfg.instance > 0 and i > self.cfg.instance:
+                break
+                
+        if accu % 10000 != 0:
+            assert (accu) // 10000 == file_num
+            with h5py.File("results/gqa_preobjects_%d.h5" % file_num, "w") as f:
+                dset1 = f.create_dataset("features", data=save_x, dtype='float32')
+                dset2 = f.create_dataset("bboxes", data=save_b, dtype='float32')
+                print('save', "results/gqa_preobjects_%d.h5" % file_num)
+        with open('results/gqa_preobjects_info.json', 'w') as f:
+            json.dump(info, f)
+            print('save', accu)
+                
+        synchronize()
+        total_time = total_timer.toc()
+        total_time_str = get_time_str(total_time)
+        num_devices = get_world_size()
+        logger.info(
+            "Total run time: {} ({} s / img per device, on {} devices)".format(
+                total_time_str, total_time * num_devices / len(self.data_loader_test.dataset), num_devices
+            )
+        )
+        total_infer_time = get_time_str(inference_timer.total_time)
+        logger.info(
+            "Model inference time: {} ({} s / img per device, on {} devices)".format(
+                total_infer_time,
+                inference_timer.total_time * num_devices / len(self.data_loader_test.dataset),
+                num_devices,
+            )
+        )        
+        if not is_main_process():
+            return
+        
+        output_folder = "results"
+        if output_folder:
+            if not os.path.exists(output_folder):
+                os.mkdir(output_folder)
+            with open(os.path.join(output_folder, "predictions.pl"), 'wb') as f:
+                pickle.dump(save_objs, f)
+            if self.cfg.MODEL.RELATION_ON:
+                with open(os.path.join(output_folder, "predictions_pred.pl"), 'wb') as f:
+                    pickle.dump(save_rels, f)
+
+
+def build_model(cfg, arguments, local_rank, distributed, produce=False):
+    return SceneGraphGeneration(cfg, arguments, local_rank, distributed, produce)
